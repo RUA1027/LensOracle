@@ -1,17 +1,16 @@
-"""utils 包统一导出入口。
+“””utils 包统一导出入口。
 
 本文件承担两项职责：
 1) 直接导出常用可视化函数；
 2) 对 model_builder 里的工厂函数做轻量转发，避免上层代码依赖
     具体实现文件路径。
 
-注意：这里的函数均是“转发包装”，不包含业务逻辑。
-"""
+注意：这里的函数均是”转发包装”，不包含业务逻辑。
+“””
 
 from .visualize import (
     plot_attention_weights,
     plot_lens_table_comparison,
-    plot_odn_reconstruction,
     plot_restoration_with_zoom,
     plot_sfr_curves,
     plot_training_dashboard,
@@ -19,7 +18,7 @@ from .visualize import (
 
 
 def build_models_from_config(*args, **kwargs):
-    """构建四模块模型（prior/lens_encoder/odn/restoration）。"""
+    “””构建双模块模型（lens_encoder/restoration）。”””
 
     from .model_builder import build_models_from_config as _impl
 
@@ -27,7 +26,7 @@ def build_models_from_config(*args, **kwargs):
 
 
 def build_trainer_from_config(*args, **kwargs):
-    """基于配置构建 ThreeStageTrainer。"""
+    """基于配置构建 LensOracleTrainer。"""
 
     from .model_builder import build_trainer_from_config as _impl
 

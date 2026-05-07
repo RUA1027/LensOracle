@@ -1,6 +1,5 @@
 """Swin Transformer 基础组件（轻量实现）。
 
-该文件提供 PriorEstimator bottleneck 所需的窗口注意力模块：
 - WindowAttention：窗口内多头自注意力 + 相对位置偏置；
 - SwinTransformerBlock：支持 shift window 的局部 Transformer block；
 - RSTB：Residual Swin Transformer Block，外包一个卷积形成残差单元。

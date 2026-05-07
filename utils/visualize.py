@@ -1,17 +1,16 @@
-"""BPFR-Net 可视化工具函数集合。
+“””BPFR-Net 可视化工具函数集合。
 
 覆盖内容包括：
 1) lens-table 通道对比图与 SFR 曲线；
 2) attention 权重热力图；
-3) ODN 重建对比图；
-4) 训练阶段关键指标仪表盘；
-5) restoration 结果局部放大图；
-6) 中心+边缘视场复原对比图；
-7) 残差热力图；
-8) 全画幅复原图保存。
+3) 训练关键指标仪表盘；
+4) restoration 结果局部放大图；
+5) 中心+边缘视场复原对比图；
+6) 残差热力图；
+7) 全画幅复原图保存。
 
-所有函数均以“可离线保存 PNG”为目标，采用无界面后端 Agg。
-"""
+所有函数均以”可离线保存 PNG”为目标，采用无界面后端 Agg。
+“””
 
 from __future__ import annotations
 
@@ -197,38 +196,16 @@ def _psnr(x: torch.Tensor, y: torch.Tensor, eps: float = 1.0e-8) -> float:
     return float(10.0 * torch.log10(torch.tensor(1.0) / (mse + eps)))
 
 
-def plot_odn_reconstruction(sharp: torch.Tensor, blur: torch.Tensor, simulated_blur: torch.Tensor, filename: str) -> None:
-    """绘制 ODN 闭环对比图（sharp / blur / simulated_blur）。"""
-
-    plt = _load_pyplot()
-    images = [
-        ("Sharp", sharp),
-        ("Blur", blur),
-        (f"ODN ({_psnr(simulated_blur, blur):.2f} dB)", simulated_blur),
-    ]
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4), squeeze=False)
-    for ax, (title, tensor) in zip(axes[0], images):
-        ax.imshow(_to_numpy_image(tensor))
-        ax.set_title(title)
-        ax.axis("off")
-    fig.tight_layout()
-    _ensure_parent(filename)
-    fig.savefig(filename, dpi=150)
-    plt.close(fig)
-
-
 def plot_training_dashboard(metrics_history: Iterable[dict], filename: str) -> None:
-    """绘制三阶段训练关键指标仪表盘。"""
+    """绘制训练关键指标仪表盘。"""
 
     plt = _load_pyplot()
     history = list(metrics_history)
     panels = [
-        ("Stage 1 L1", "Val_PSF_SFR_L1"),
         ("Lens ID", "Val_LensIdentifiability"),
-        ("Stage 2 ODN L1", "Val_ODN_L1"),
-        ("Stage 3 PSNR", "PSNR"),
+        ("PSNR", "PSNR"),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(10, 7), squeeze=False)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), squeeze=False)
     for ax, (title, key) in zip(axes.ravel(), panels):
         xs = [float(item.get("step", idx)) for idx, item in enumerate(history) if key in item]
         ys = [float(item[key]) for item in history if key in item]

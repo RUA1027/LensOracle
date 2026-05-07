@@ -131,10 +131,8 @@ class LensTableEncoder(nn.Module):
     - `F_2`: 下采样一层；
     - `F_3`: 下采样两层。
 
-    与 PriorEstimator 的关系：
-    - PriorEstimator 的输出是 `[B, 64, 48, 67]` 物理参数表；
-    - 本模块（LensTableEncoder）负责接收这个表，提取多尺度物理特征；
-    - 这些特征最后会喂给 Restoration 网络，通过 CrossAttention 注入主干。
+    接收来自数据集的 GT lens-table，提取多尺度物理特征，
+    这些特征最后会喂给 Restoration 网络，通过 CrossAttention 注入主干。
     """
 
     def __init__(

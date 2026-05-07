@@ -1,30 +1,8 @@
 # BPFR-Net lens-table fusion 默认配置
-# 说明：本配置服务于“三阶段训练 + 统一测试”流程。
-# - Stage 1: 仅训练 BlindPriorEstimator，监督目标为原生 gt_psf_sfr（[64,48,67]）
-# - Stage 2: 冻结 prior，训练 ODN 做 sharp->blur 物理闭环
-# - Stage 3: 冻结 prior/ODN，训练 LensTableEncoder + Restoration
+# 说明：本配置服务于单阶段训练流程，训练 LensTableEncoder + Restoration 主干网络。
 
 # -----------------------------------------------------------------------------
-# 1) BlindPriorEstimator（从 blur 预测原生 lens-table）
-# -----------------------------------------------------------------------------
-prior_estimator:
-  # 图像编码器四层通道数；代码要求长度必须为 4。
-  encoder_channels: [48, 96, 192, 256]
-  # 每个 encoder stage 的 NAFBlock 数。
-  blocks_per_level: 2
-  # bottleneck 中 RSTB 堆叠个数（每个 RSTB 内部 num_blocks 固定为 2）。
-  rstb_num_blocks: 2
-  # Swin/RSTB 窗口大小。
-  rstb_window_size: 8
-  # Swin/RSTB 注意力头数。
-  rstb_num_heads: 8
-  # 全局池化后 latent 向量维度。
-  d_latent: 512
-  # 解码器种子特征通道，决定 3x4 起始特征图宽度。
-  decoder_seed_channels: 256
-
-# -----------------------------------------------------------------------------
-# 2) LensTableEncoder（把 [B,64,48,67] 编码为 F_1/F_2/F_3）
+# 1) LensTableEncoder（把 [B,64,48,67] 编码为 F_1/F_2/F_3）
 # -----------------------------------------------------------------------------
 lens_table_encoder:
   # 三层输出通道：F_1, F_2, F_3。
@@ -33,7 +11,7 @@ lens_table_encoder:
   blocks_per_level: [2, 2, 3]
 
 # -----------------------------------------------------------------------------
-# 3) Cross-Attention 路由超参（ODN 与 Restoration 共享这组设置）
+# 2) Cross-Attention 路由超参（与 Restoration 共享这组设置）
 # -----------------------------------------------------------------------------
 cross_attention:
   # 多头注意力头数。
@@ -45,33 +23,13 @@ cross_attention:
   # Fourier 坐标编码频率数，位置编码维度 = 4 * 该值。
   fourier_feat_num_freqs: 8
 
-# -----------------------------------------------------------------------------
-# 4) ODN（Stage 2 的退化模拟网络）
-# -----------------------------------------------------------------------------
-odn:
-  # ODN 主干基准通道。
-  base_channels: 32
-  # ODN bottleneck 通道。
-  bottleneck_channels: 96
-  # ODN 内部 cross-attention 头数。
-  num_heads: 4
-  # ODN 内部 cross-attention 每头维度。
-  head_dim: 32
-  # ODN 每个上下采样 stage 的 NAFBlock 数。
-  num_blocks: 1
-  # Stage 2 ODN L1 loss weight.
-  loss_weight: 0.5
-
 ablation:
   variant: "correctprior"
-  train_prior_mode: "correct_gt"
-  eval_prior_mode: "correct_gt"
   lens_encoder_enabled: true
   lens_encoder_padding: "circular"
-  incorrect_prior_policy: "same_split"
 
 # -----------------------------------------------------------------------------
-# 5) 数据协议（镜头级划分与清单）
+# 3) 数据协议（镜头级划分与清单）
 # -----------------------------------------------------------------------------
 lens_split:
   # 镜头划分清单路径；存在则直接读取，不存在则按下方 ratio 自动生成。
@@ -86,28 +44,7 @@ lens_split:
   test_ratio: 0.1
 
 # -----------------------------------------------------------------------------
-# 6) Stage 1 毕业评估（仅用于报告与阈值判定，不直接控制训练停机）
-# -----------------------------------------------------------------------------
-stage1_graduation:
-  # 报告模式标签，当前主要用于写入 stage1_graduation_report.json。
-  mode: "soft"
-  # 综合分数中 prior L1 分量权重。
-  prior_l1_weight: 0.45
-  # 综合分数中 prior MSSSIM 分量权重。
-  prior_msssim_weight: 0.35
-  # 综合分数中镜头可辨识性分量权重。
-  lens_identifiability_weight: 0.20
-  # batch_std 低于该值时记告警。
-  batch_std_warn_min: 0.010
-  # batch_std 低于该值时判定 FAIL_COLLAPSE。
-  batch_std_fail_min: 0.004
-  # prior L1 高于该值可触发 FAIL_PHYSICS_STRUCTURE。
-  prior_l1_fail_max: 0.22
-  # prior MSSSIM 低于该值可触发 FAIL_PHYSICS_STRUCTURE。
-  prior_msssim_fail_min: 0.55
-
-# -----------------------------------------------------------------------------
-# 7) OmniLens++ / MixLib 数据路径与切分
+# 4) OmniLens++ / MixLib 数据路径与切分
 # -----------------------------------------------------------------------------
 omnilens2:
   # OmniLens PSF-SFR .pth 根目录（MixLib 通过 lens_name 读取 gt_psf_sfr 使用）。
@@ -126,7 +63,7 @@ omnilens2:
   mixlib_split_seed: 42
 
 # -----------------------------------------------------------------------------
-# 8) OOD 评测默认路径（test.py 的 --dataset-type 默认回退）
+# 5) OOD 评测默认路径（test.py 的 --dataset-type 默认回退）
 # -----------------------------------------------------------------------------
 ood_eval:
   # OOD 根目录。
@@ -139,7 +76,7 @@ ood_eval:
   realdof_dir: "RealDOF"
 
 # -----------------------------------------------------------------------------
-# 9) Restoration 主干配置（Stage 3）
+# 6) Restoration 主干配置
 # -----------------------------------------------------------------------------
 restoration:
   # 四层 encoder 通道，长度必须为 4。
@@ -152,7 +89,7 @@ restoration:
   coordgate_mlp_hidden: 32
   losses:
     charbonnier:
-      # Stage 3 主重建损失（启用时替代 L1 作为 base loss）。
+      # 主重建损失（启用时替代 L1 作为 base loss）。
       enabled: true
       # Charbonnier 平滑项 epsilon。
       epsilon: 1.0e-3
@@ -170,45 +107,29 @@ restoration:
       weight: 0.10
 
 # -----------------------------------------------------------------------------
-# 10) 训练器配置
+# 7) 训练器配置
 # -----------------------------------------------------------------------------
 training:
   optimizer:
     # 支持 "adam" 或 "adamw"；其余值将按 AdamW 处理。
     type: "adamw"
-    # Stage 1: prior_estimator 学习率。
-    lr_prior: 2.0e-4
-    # Stage 3: lens_table_encoder 学习率。
+    # lens_table_encoder 学习率。
     lr_lens_encoder: 1.0e-4
-    # Stage 2: ODN 学习率。
-    lr_odn: 1.0e-4
-    # Stage 3: restoration_net 学习率。
+    # restoration_net 学习率。
     lr_restoration: 1.0e-4
     # 所有优化器统一权重衰减。
     weight_decay: 0.01
   gradient_clip:
-    # Stage 3 restoration 梯度裁剪阈值。
+    # restoration 梯度裁剪阈值。
     restoration: 2.5
-    # Stage 1 prior 梯度裁剪阈值。
-    prior: 1.0
-    # Stage 3 lens encoder 梯度裁剪阈值。
+    # lens encoder 梯度裁剪阈值。
     lens_encoder: 1.0
-    # Stage 2 ODN 梯度裁剪阈值。
-    odn: 1.0
   # 梯度累积步数；>1 时每 accumulation_steps 次反传才 step 一次。
   accumulation_steps: 4
   stage_schedule:
-    # Stage 1 训练迭代数。
-    stage1_iterations: 0
-    # Stage 2 训练迭代数。
-    stage2_iterations: 0
-    # Stage 3 训练迭代数。
+    # 训练迭代数。
     stage3_iterations: 400000
-    # Stage 1 train/val dataloader 的 batch size 基准。
-    stage1_batch_size: 16
-    # Stage 2 train/val dataloader 的 batch size 基准。
-    stage2_batch_size: 8
-    # Stage 3 train/val dataloader 的 batch size 基准。
+    # train/val dataloader 的 batch size 基准。
     stage3_batch_size: 8
   nonfinite_guard:
     # 连续出现 non-finite 梯度/损失的容忍次数。
@@ -223,14 +144,14 @@ training:
   amp_dtype: "bfloat16"
   # 是否开启模块级 checkpoint 以省显存（增加算力开销）。
   grad_checkpointing: true
-  # Stage 3 总变差正则权重。
+  # 总变差正则权重。
   tv_weight: 0.01
 
 # -----------------------------------------------------------------------------
-# 11) 数据加载与裁剪
+# 8) 数据加载与裁剪
 # -----------------------------------------------------------------------------
 data:
-  # 通用 batch size 回退值；优先级低于 stage_schedule.*_batch_size。
+  # 通用 batch size 回退值；优先级低于 stage_schedule.stage3_batch_size。
   batch_size: 8
   # 训练裁剪尺寸（MixLib train 模式）。
   crop_size: 256
@@ -245,7 +166,7 @@ data:
     random_rotate90: false
 
 # -----------------------------------------------------------------------------
-# 12) 可视化导出
+# 9) 可视化导出
 # -----------------------------------------------------------------------------
 visualization:
   export:
@@ -259,7 +180,7 @@ visualization:
     export_attention_weights: true
 
 # -----------------------------------------------------------------------------
-# 13) 实验与输出目录
+# 10) 实验与输出目录
 # -----------------------------------------------------------------------------
 experiment:
   # 实验基础名（也用于固定 checkpoint 目录的一部分）。
@@ -289,12 +210,8 @@ experiment:
     log_dir: "runs"
 
 # -----------------------------------------------------------------------------
-# 14) 最佳模型判定策略
+# 11) 最佳模型判定策略
 # -----------------------------------------------------------------------------
 checkpoint:
-  # Stage 1 选择 best 的指标名（支持别名，默认越小越好）。
-  stage1_metric: "val_psf_sfr_l1"
-  # Stage 2 选择 best 的指标名（默认越小越好）。
-  stage2_metric: "val_odn_l1"
-  # Stage 3 选择 best 的指标名（默认 psnr，越大越好）。
+  # 选择 best 的指标名（默认 psnr，越大越好）。
   stage3_metric: "psnr"

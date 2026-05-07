@@ -1,7 +1,7 @@
 """模型、Trainer 和 DataLoader 构建工具。
 
-本文件是配置到运行时对象的唯一集中入口。新版返回完整的 lens-table
-fusion pipeline：PriorEstimator、LensTableEncoder、ODN 和 Restoration。
+本文件是配置到运行时对象的唯一集中入口，构建 LensTableEncoder
+和 Restoration 的 lens-table fusion pipeline（仅 Stage 3）。
 """
 
 from __future__ import annotations
@@ -13,15 +13,12 @@ from typing import Optional
 from torch.utils.data import DataLoader
 
 from config import Config
-from models.degradation_simulator import OpticalDegradationNetwork
 from models.lens_table_encoder import LensTableEncoder
 from models.losses import CharbonnierLoss, MSSSIMLoss, VGGPerceptualLoss
-from models.prior_estimator import BlindPriorEstimator
 from models.restoration_backbone import CoordGateNAFNetRestoration
-from trainer import ThreeStageTrainer
+from trainer import LensOracleTrainer
 from utils.evaluation_datasets import BlurOnlyTestDataset, DPDDTestDataset, GenericPairedTestDataset
 from utils.omnilens_dataset import (
-    LensGroupedBatchSampler,
     MixLibDataset,
     create_lens_split_manifest,
     load_lens_split_manifest,
@@ -29,48 +26,26 @@ from utils.omnilens_dataset import (
 
 
 def build_models_from_config(config: Config, device: str):
-    """根据配置构建完整四模块 pipeline。
+    """根据配置构建双模块 lens-table fusion pipeline。
 
 返回顺序固定为：
-1) prior_estimator
-2) lens_table_encoder
-3) odn
-4) restoration_net
+1) lens_table_encoder
+2) restoration_net
 
 该顺序被 train/test 入口与 checkpoint 加载逻辑共同依赖。
 """
 
     # grad_checkpointing 是全局开关，会传给支持 checkpoint 的模型模块。
     use_checkpoint = bool(getattr(config.training, "grad_checkpointing", False))
-    prior_cfg = config.prior_estimator
     encoder_cfg = config.lens_table_encoder
     attn_cfg = config.cross_attention
-    odn_cfg = config.odn
     restoration_cfg = config.restoration
 
-    prior_estimator = BlindPriorEstimator(
-        encoder_channels=prior_cfg.encoder_channels,
-        blocks_per_level=prior_cfg.blocks_per_level,
-        rstb_num_blocks=prior_cfg.rstb_num_blocks,
-        rstb_window_size=prior_cfg.rstb_window_size,
-        rstb_num_heads=prior_cfg.rstb_num_heads,
-        d_latent=prior_cfg.d_latent,
-        decoder_seed_channels=prior_cfg.decoder_seed_channels,
-        use_checkpoint=use_checkpoint,
-    ).to(device)
     lens_table_encoder = LensTableEncoder(
         in_channels=67,
         channels=encoder_cfg.channels,
         blocks_per_level=encoder_cfg.blocks_per_level,
         padding_mode=getattr(config.ablation, "lens_encoder_padding", "circular"),
-    ).to(device)
-    odn = OpticalDegradationNetwork(
-        base_channels=odn_cfg.base_channels,
-        bottleneck_channels=odn_cfg.bottleneck_channels,
-        num_heads=odn_cfg.num_heads,
-        head_dim=odn_cfg.head_dim,
-        num_blocks=odn_cfg.num_blocks,
-        fourier_feat_num_freqs=attn_cfg.fourier_feat_num_freqs,
     ).to(device)
     restoration_net = CoordGateNAFNetRestoration(
         encoder_channels=restoration_cfg.encoder_channels,
@@ -85,7 +60,7 @@ def build_models_from_config(config: Config, device: str):
         use_lens_attention=bool(getattr(config.ablation, "lens_encoder_enabled", True)),
         use_checkpoint=use_checkpoint,
     ).to(device)
-    return prior_estimator, lens_table_encoder, odn, restoration_net
+    return lens_table_encoder, restoration_net
 
 
 def _get_loss_cfg(config: Config, key: str, default=None):
@@ -99,14 +74,12 @@ def _get_loss_cfg(config: Config, key: str, default=None):
 
 def build_trainer_from_config(
     config: Config,
-    prior_estimator,
     lens_table_encoder,
-    odn,
     restoration_net,
     device: str,
     tensorboard_dir: Optional[str] = None,
 ):
-    """构建 ThreeStageTrainer，并延迟初始化 VGG/MS-SSIM 等较重 loss。"""
+    """构建 LensOracleTrainer，并延迟初始化 VGG/MS-SSIM 等较重 loss。"""
 
     # 若用户未显式传入 tensorboard_dir，则按实验配置推导默认路径。
     if tensorboard_dir is None and getattr(config.experiment.tensorboard, "enabled", False):
@@ -135,22 +108,18 @@ def build_trainer_from_config(
     ms_ssim_weight = float(getattr(ms_cfg, "weight", 0.0)) if ms_cfg is not None else 0.0
     ms_ssim_loss_builder = (lambda: MSSSIMLoss().to(device)) if ms_ssim_enabled and ms_ssim_weight > 0 else None
 
-    return ThreeStageTrainer(
-        prior_estimator=prior_estimator,
+    total_iterations = int(getattr(config.training.stage_schedule, "stage3_iterations", 0))
+
+    return LensOracleTrainer(
         lens_table_encoder=lens_table_encoder,
-        odn=odn,
         restoration_net=restoration_net,
-        lr_prior=config.training.optimizer.lr_prior,
         lr_lens_encoder=config.training.optimizer.lr_lens_encoder,
-        lr_odn=config.training.optimizer.lr_odn,
         lr_restoration=config.training.optimizer.lr_restoration,
         optimizer_type=config.training.optimizer.type,
         weight_decay=config.training.optimizer.weight_decay,
-        grad_clip_prior=config.training.gradient_clip.prior,
         grad_clip_lens_encoder=config.training.gradient_clip.lens_encoder,
-        grad_clip_odn=config.training.gradient_clip.odn,
         grad_clip_restoration=config.training.gradient_clip.restoration,
-        stage_schedule=config.training.stage_schedule,
+        total_iterations=total_iterations,
         use_amp=config.training.use_amp,
         amp_dtype=config.training.amp_dtype,
         accumulation_steps=config.training.accumulation_steps,
@@ -166,9 +135,6 @@ def build_trainer_from_config(
         ms_ssim_weight=ms_ssim_weight,
         ms_ssim_enabled=ms_ssim_enabled,
         tv_weight=float(getattr(config.training, "tv_weight", 0.01)),
-        odn_loss_weight=float(getattr(config.odn, "loss_weight", 0.5)),
-        train_prior_mode=str(getattr(config.ablation, "train_prior_mode", "correct_gt")),
-        eval_prior_mode=str(getattr(config.ablation, "eval_prior_mode", "correct_gt")),
         lens_encoder_enabled=bool(getattr(config.ablation, "lens_encoder_enabled", True)),
         ablation=dict(getattr(config.ablation, "__dict__", {})),
         nonfinite_patience=getattr(config.training.nonfinite_guard, "patience", 3),
@@ -186,29 +152,21 @@ def _pin_memory(config: Config) -> bool:
 def _resolve_mixlib_batch_size(
     config: Config,
     mode: str,
-    stage_name: Optional[str],
     batch_size_override: Optional[int],
 ) -> int:
-    """按阶段/模式解析 MixLib 批大小优先级。
+    """按模式解析 MixLib 批大小优先级。
 
 优先级：
 1) 调用方显式 batch_size_override；
-2) stage_schedule 对应阶段 batch size；
+2) stage_schedule.stage3_batch_size（train 模式）；
 3) data.batch_size。
 """
 
     if batch_size_override is not None:
         return int(batch_size_override)
     stage_schedule = getattr(config.training, "stage_schedule", None)
-    if stage_schedule is not None:
-        if stage_name == "stage1":
-            return int(getattr(stage_schedule, "stage1_batch_size", config.data.batch_size))
-        if stage_name == "stage2":
-            return int(getattr(stage_schedule, "stage2_batch_size", config.data.batch_size))
-        if stage_name == "stage3":
-            return int(getattr(stage_schedule, "stage3_batch_size", config.data.batch_size))
-        if mode == "train":
-            return int(getattr(stage_schedule, "stage3_batch_size", config.data.batch_size))
+    if stage_schedule is not None and mode == "train":
+        return int(getattr(stage_schedule, "stage3_batch_size", config.data.batch_size))
     return int(config.data.batch_size)
 
 
@@ -232,24 +190,13 @@ def build_mixlib_dataloader(
     config: Config,
     mode: str = "train",
     batch_size_override: Optional[int] = None,
-    stage_name: Optional[str] = None,
 ):
     """构建 MixLibDataset 的 DataLoader。
 
-关键策略：
-1) Stage1 train 使用 LensGroupedBatchSampler，强化同镜头样本对比；
-2) Stage2/3 或 val/test 使用常规 batch 采样；
-3) test 模式下可按场景选择是否强制 require_psf_sfr。
+PSF-SFR 数据始终被加载供 lens table encoder 使用。
 """
 
     split_manifest = _resolve_lens_manifest(config)
-    prior_mode = (
-        str(getattr(config.ablation, "train_prior_mode", "correct_gt"))
-        if mode == "train"
-        else str(getattr(config.ablation, "eval_prior_mode", "correct_gt"))
-    )
-    require_incorrect_psf_sfr = prior_mode == "incorrect_gt"
-    require_psf_sfr = prior_mode in {"correct_gt", "incorrect_gt"}
     dataset = MixLibDataset(
         ab_dir=config.omnilens2.mixlib_ab_dir,
         gt_dir=config.omnilens2.mixlib_gt_dir,
@@ -263,27 +210,10 @@ def build_mixlib_dataloader(
         test_split_ratio=getattr(config.omnilens2, "mixlib_test_split_ratio", 0.0),
         split_seed=config.omnilens2.mixlib_split_seed,
         split_manifest=split_manifest,
-        require_psf_sfr=require_psf_sfr,
-        require_incorrect_psf_sfr=require_incorrect_psf_sfr,
-        incorrect_prior_policy=str(getattr(config.ablation, "incorrect_prior_policy", "same_split")),
+        require_psf_sfr=True,
     )
-    effective_batch_size = _resolve_mixlib_batch_size(config, mode, stage_name, batch_size_override)
+    effective_batch_size = _resolve_mixlib_batch_size(config, mode, batch_size_override)
     batch_size = effective_batch_size if mode == "train" else max(1, effective_batch_size // 4)
-    if mode == "train" and stage_name == "stage1":
-        # Stage1 按 lens 分组采样：每个 batch 聚合多个镜头、每镜头固定样本数。
-        sampler = LensGroupedBatchSampler(
-            lens_names=[str(sample.get("lens_name", "unknown")) for sample in dataset.samples],
-            samples_per_lens=2,
-            lenses_per_batch=max(1, batch_size // 2),
-            shuffle=True,
-            seed=config.lens_split.split_seed,
-        )
-        return DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=_pin_memory(config),
-        )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -362,12 +292,12 @@ def build_test_dataloader_by_type(
     dataset_type: str,
     config: Config,
     data_root_override: str = None,
-    require_psf_sfr: bool = False,
-    require_incorrect_psf_sfr: bool = False,
 ):
     """按 dataset_type 构建测试 DataLoader。
 
 返回 `(loader, has_gt)`，其中 has_gt 用于控制指标导出逻辑。
+PSF-SFR 数据始终被加载供 lens table encoder 使用，因此仅支持
+dataset-type='omnilens_mixlib'。
 """
 
     info = DATASET_TYPE_REGISTRY[dataset_type]
@@ -375,10 +305,10 @@ def build_test_dataloader_by_type(
     has_gt = info["has_gt"]
     if data_root_override is None:
         data_root_override = _resolve_ood_default_root(dataset_type, config)
-    if cls_key != "omnilens_mixlib" and (require_psf_sfr or require_incorrect_psf_sfr):
+    if cls_key != "omnilens_mixlib":
         raise ValueError(
-            "OOD datasets do not provide PSF-SFR; use the restoration_only ablation "
-            "or dataset-type='omnilens_mixlib'."
+            "OOD datasets do not provide PSF-SFR data; only dataset-type='omnilens_mixlib' "
+            "is supported in the current pipeline."
         )
 
     if cls_key == "dpdd_test":
@@ -418,9 +348,7 @@ def build_test_dataloader_by_type(
             if use_internal_lens_split
             else 0.0,
             split_seed=config.omnilens2.mixlib_split_seed,
-            require_psf_sfr=require_psf_sfr,
-            require_incorrect_psf_sfr=require_incorrect_psf_sfr,
-            incorrect_prior_policy=str(getattr(config.ablation, "incorrect_prior_policy", "same_split")),
+            require_psf_sfr=True,
             split_manifest=split_manifest,
         )
         collate_fn = None
@@ -437,13 +365,10 @@ def build_test_dataloader_by_type(
 
 
 def build_test_dataloader_from_config(config: Config, data_root_override: str = None):
-    """默认测试入口：使用 omnilens_mixlib 类型。"""
+    """默认测试入口：使用 omnilens_mixlib 类型，始终加载 PSF-SFR。"""
 
-    prior_mode = str(getattr(config.ablation, "eval_prior_mode", "correct_gt"))
     return build_test_dataloader_by_type(
         "omnilens_mixlib",
         config=config,
         data_root_override=data_root_override,
-        require_psf_sfr=prior_mode in {"correct_gt", "incorrect_gt"},
-        require_incorrect_psf_sfr=prior_mode == "incorrect_gt",
     )

@@ -5,10 +5,7 @@
 2) 兼容旧字段：在加载时吸收部分历史字段命名，降低配置迁移成本；
 3) 运行时覆盖：支持 `--override a.b=value` 动态覆盖任意层级字段。
 
-整体服务于三阶段流程：
-- Stage 1：训练 prior_estimator；
-- Stage 2：冻结 prior，训练 ODN；
-- Stage 3：训练 lens_table_encoder + restoration。
+整体服务于单阶段流程：训练 lens_table_encoder + restoration 主干网络。
 """
 
 from __future__ import annotations
@@ -21,19 +18,6 @@ import yaml
 
 
 @dataclass
-class PriorEstimatorConfig:
-    """PriorEstimator 模块的结构超参数。"""
-
-    encoder_channels: List[int] = field(default_factory=lambda: [48, 96, 192, 256])
-    blocks_per_level: int = 2
-    rstb_num_blocks: int = 2
-    rstb_window_size: int = 8
-    rstb_num_heads: int = 8
-    d_latent: int = 512
-    decoder_seed_channels: int = 256
-
-
-@dataclass
 class LensTableEncoderConfig:
     """LensTableEncoder 的多尺度通道与层深配置。"""
 
@@ -43,7 +27,7 @@ class LensTableEncoderConfig:
 
 @dataclass
 class CrossAttentionConfig:
-    """Cross-attention 路由超参数（ODN 与 Restoration 共用）。"""
+    """Cross-attention 路由超参数（与 Restoration 共用）。"""
 
     num_heads: int = 4
     head_dim: int = 64
@@ -52,27 +36,12 @@ class CrossAttentionConfig:
 
 
 @dataclass
-class ODNConfig:
-    """Optical Degradation Network（Stage 2）配置。"""
-
-    base_channels: int = 32
-    bottleneck_channels: int = 96
-    num_heads: int = 4
-    head_dim: int = 32
-    num_blocks: int = 1
-    loss_weight: float = 0.5
-
-
-@dataclass
 class AblationConfig:
-    """Stage3-only restoration ablation switches."""
+    """Restoration ablation switches."""
 
     variant: str = "correctprior"
-    train_prior_mode: str = "correct_gt"
-    eval_prior_mode: str = "correct_gt"
     lens_encoder_enabled: bool = True
     lens_encoder_padding: str = "circular"
-    incorrect_prior_policy: str = "same_split"
 
 
 @dataclass
@@ -84,20 +53,6 @@ class LensSplitConfig:
     train_ratio: float = 0.8
     val_ratio: float = 0.1
     test_ratio: float = 0.1
-
-
-@dataclass
-class Stage1GraduationConfig:
-    """Stage 1 毕业评估配置（报告与阈值判定）。"""
-
-    mode: str = "soft"
-    prior_l1_weight: float = 0.45
-    prior_msssim_weight: float = 0.35
-    lens_identifiability_weight: float = 0.20
-    batch_std_warn_min: float = 0.010
-    batch_std_fail_min: float = 0.004
-    prior_l1_fail_max: float = 0.22
-    prior_msssim_fail_min: float = 0.55
 
 
 @dataclass
@@ -125,7 +80,7 @@ class OODEvalConfig:
 
 @dataclass
 class RestorationConfig:
-    """Stage 3 Restoration 主干配置。"""
+    """Restoration 主干配置。"""
 
     @dataclass
     class CharbonnierLossConfig:
@@ -177,9 +132,7 @@ class OptimizerConfig:
     """分模块学习率与优化器配置。"""
 
     type: str = "adamw"
-    lr_prior: float = 2.0e-4
     lr_lens_encoder: float = 1.0e-4
-    lr_odn: float = 1.0e-4
     lr_restoration: float = 1.0e-4
     weight_decay: float = 0.01
 
@@ -189,20 +142,14 @@ class GradientClipConfig:
     """不同子模块的梯度裁剪阈值。"""
 
     restoration: float = 2.5
-    prior: float = 1.0
     lens_encoder: float = 1.0
-    odn: float = 1.0
 
 
 @dataclass
 class StageScheduleConfig:
-    """三阶段训练步数与批大小配置。"""
+    """训练步数与批大小配置。"""
 
-    stage1_iterations: int = 0
-    stage2_iterations: int = 0
     stage3_iterations: int = 400_000
-    stage1_batch_size: int = 4
-    stage2_batch_size: int = 4
     stage3_batch_size: int = 4
 
 
@@ -298,8 +245,6 @@ class ExperimentConfig:
 class CheckpointConfig:
     """最佳模型判定指标配置。"""
 
-    stage1_metric: str = "val_psf_sfr_l1"
-    stage2_metric: str = "val_odn_l1"
     stage3_metric: str = "psnr"
 
 
@@ -312,13 +257,10 @@ class Config:
     - save: 以 YAML 形式落盘，便于复现实验。
     """
 
-    prior_estimator: PriorEstimatorConfig = field(default_factory=PriorEstimatorConfig)
     lens_table_encoder: LensTableEncoderConfig = field(default_factory=LensTableEncoderConfig)
     cross_attention: CrossAttentionConfig = field(default_factory=CrossAttentionConfig)
-    odn: ODNConfig = field(default_factory=ODNConfig)
     ablation: AblationConfig = field(default_factory=AblationConfig)
     lens_split: LensSplitConfig = field(default_factory=LensSplitConfig)
-    stage1_graduation: Stage1GraduationConfig = field(default_factory=Stage1GraduationConfig)
     omnilens2: OmniLens2Config = field(default_factory=OmniLens2Config)
     ood_eval: OODEvalConfig = field(default_factory=OODEvalConfig)
     restoration: RestorationConfig = field(default_factory=RestorationConfig)
@@ -447,21 +389,14 @@ def _build_config_from_dict(data: Dict[str, Any]) -> Config:
     """从 YAML 字典构造 Config，并执行旧字段兼容转换。
 
     当前兼容策略包含：
-    - prior_estimator.z_lens_dim -> d_latent；
-    - 丢弃若干已废弃字段（如 output_channels、sft_kernel_size 等）。
+    - 训练调度中移除已废弃的 stage2_warmup_iterations 字段；
+    - Restoration 中移除 sft_kernel_size、perceptual_weight 等旧字段；
+    - lens_split 兼容旧 key 名 protocol。
     """
-
-    # PriorEstimator 历史字段兼容。
-    prior_data = dict(data.get("prior_estimator", {}) or {})
-    prior_data.pop("output_channels", None)
-    if "z_lens_dim" in prior_data and "d_latent" not in prior_data:
-        prior_data["d_latent"] = prior_data.pop("z_lens_dim")
 
     # 训练调度历史字段兼容。
     training_data = dict(data.get("training", {}) or {})
     stage_schedule_data = dict(training_data.get("stage_schedule", {}) or {})
-    if "stage2_warmup_iterations" in stage_schedule_data:
-        stage_schedule_data.pop("stage2_warmup_iterations", None)
 
     # Restoration 历史字段兼容。
     restoration_data = dict(data.get("restoration", {}) or {})
@@ -473,26 +408,13 @@ def _build_config_from_dict(data: Dict[str, Any]) -> Config:
     lens_split_data = dict(data.get("protocol", {}) or {})
     lens_split_data.update(dict(data.get("lens_split", {}) or {}))
 
-    graduation_data = dict(data.get("stage1_graduation", {}) or {})
-    if (
-        "prototype_margin_weight" in graduation_data
-        and "lens_identifiability_weight" not in graduation_data
-    ):
-        graduation_data["lens_identifiability_weight"] = graduation_data.pop("prototype_margin_weight")
-
     return Config(
-        prior_estimator=_dict_to_dataclass(PriorEstimatorConfig, prior_data),
         lens_table_encoder=_dict_to_dataclass(
             LensTableEncoderConfig, data.get("lens_table_encoder", {})
         ),
         cross_attention=_dict_to_dataclass(CrossAttentionConfig, data.get("cross_attention", {})),
-        odn=_dict_to_dataclass(ODNConfig, data.get("odn", {})),
         ablation=_dict_to_dataclass(AblationConfig, data.get("ablation", {})),
         lens_split=_dict_to_dataclass(LensSplitConfig, lens_split_data),
-        stage1_graduation=_dict_to_dataclass(
-            Stage1GraduationConfig,
-            graduation_data,
-        ),
         omnilens2=_dict_to_dataclass(OmniLens2Config, data.get("omnilens2", {})),
         ood_eval=_dict_to_dataclass(OODEvalConfig, data.get("ood_eval", {})),
         restoration=_dict_to_dataclass(RestorationConfig, restoration_data),

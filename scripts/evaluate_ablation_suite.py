@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import load_config
-from test import _load_checkpoint, _resolve_filename, _resolve_prior_table, _sanitize_for_json
+from test import _load_checkpoint, _resolve_filename, _sanitize_for_json
 from utils.metrics import PerformanceEvaluator
 from utils.model_builder import build_models_from_config, build_test_dataloader_by_type, get_supported_dataset_types
 
@@ -122,20 +122,16 @@ def _run_variant(
     expected_filenames: List[str] | None,
 ) -> tuple[List[Dict[str, Any]], List[str]]:
     config = load_config(entry["config"])
-    prior_mode = str(getattr(config.ablation, "eval_prior_mode", "correct_gt"))
-    lens_encoder_enabled = bool(getattr(config.ablation, "lens_encoder_enabled", True))
     device = _resolve_device(config, suite)
     config.experiment.device = device
 
-    prior_estimator, lens_encoder, odn, restoration_net = build_models_from_config(config, device)
-    _load_checkpoint(prior_estimator, lens_encoder, odn, restoration_net, entry["checkpoint"], device)
+    lens_encoder, restoration_net = build_models_from_config(config, device)
+    _load_checkpoint(lens_encoder, restoration_net, entry["checkpoint"], device)
     evaluator = PerformanceEvaluator(device=device)
     loader, _ = build_test_dataloader_by_type(
         dataset_type,
         config=config,
         data_root_override=data_root if data_root is not None else "",
-        require_psf_sfr=prior_mode in {"correct_gt", "incorrect_gt"},
-        require_incorrect_psf_sfr=prior_mode == "incorrect_gt",
     )
 
     rows: List[Dict[str, Any]] = []
@@ -147,12 +143,10 @@ def _run_variant(
             sharp = sharp_raw.to(device) if torch.is_tensor(sharp_raw) else None
             crop_info = batch.get("crop_info")
             crop_info = crop_info.to(device) if torch.is_tensor(crop_info) else None
-            prior_table = _resolve_prior_table(batch, prior_mode, device)
-            lens_features = (
-                lens_encoder(prior_table)
-                if lens_encoder_enabled and prior_table is not None
-                else None
-            )
+            prior_table = batch.get("gt_psf_sfr")
+            if torch.is_tensor(prior_table):
+                prior_table = prior_table.to(device)
+            lens_features = lens_encoder(prior_table) if prior_table is not None else None
             restored = restoration_net(blur, lens_features, crop_info=crop_info)
 
             for index in range(int(blur.shape[0])):

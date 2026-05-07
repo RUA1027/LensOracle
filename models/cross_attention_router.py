@@ -93,7 +93,7 @@ class CrossAttentionRouter(nn.Module):
         """执行跨注意力路由。
 
         参数约定：
-        - `x`: 查询特征（通常来自 restoration/ODN 主干），形状 `[B,C,H,W]`；
+        - `x`: 查询特征（来自 restoration 主干），形状 `[B,C,H,W]`；
         - `prior_feat`: 键值特征（来自 lens-table 编码器），形状 `[B,Cp,Hp,Wp]`；
         - `coord_map`: 查询位置的 `(r,theta)` 坐标图，形状 `[B,2,H,W]`。
 

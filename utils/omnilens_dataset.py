@@ -3,8 +3,7 @@
 该模块服务于 BPFR-Net 的 lens-table 监督训练，核心能力包括：
 1) 读取并校验 PSF-SFR lens-table 张量；
 2) 构建镜头级 train/val/test 划分；
-3) 为 Stage1 提供按镜头分组采样器；
-4) 为 MixLib 样本提供图像+lens-table 对齐数据输出。
+3) 为 MixLib 样本提供图像+lens-table 对齐数据输出。
 """
 
 from __future__ import annotations
@@ -13,12 +12,12 @@ import json
 import random
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import torch
 import torchvision.transforms as transforms
 from PIL import Image, ImageOps
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -158,69 +157,6 @@ def create_lens_split_manifest(
     return manifest
 
 
-class LensGroupedBatchSampler(Sampler[list[int]]):
-    """按镜头分组的批采样器。
-
-    主要用于 Stage1：
-    - 每个镜头采样固定 `samples_per_lens`；
-    - 每个 batch 包含固定 `lenses_per_batch` 个镜头。
-    """
-
-    def __init__(
-        self,
-        lens_names: Sequence[str],
-        samples_per_lens: int = 2,
-        lenses_per_batch: int = 8,
-        shuffle: bool = True,
-        seed: int = 42,
-    ):
-        """初始化分组采样器并构建 `lens -> indices` 映射。"""
-
-        self.lens_names = list(lens_names)
-        self.samples_per_lens = max(1, int(samples_per_lens))
-        self.lenses_per_batch = max(1, int(lenses_per_batch))
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
-
-        self._lens_to_indices: Dict[str, list[int]] = OrderedDict()
-        for index, lens_name in enumerate(self.lens_names):
-            self._lens_to_indices.setdefault(str(lens_name), []).append(index)
-
-    def __iter__(self) -> Iterator[list[int]]:
-        """按设置生成批索引序列。"""
-
-        rng = random.Random(self.seed)
-        grouped: list[tuple[str, list[int]]] = []
-        for lens_name, indices in self._lens_to_indices.items():
-            current = list(indices)
-            if self.shuffle:
-                rng.shuffle(current)
-            for start in range(0, len(current), self.samples_per_lens):
-                chunk = current[start : start + self.samples_per_lens]
-                if len(chunk) == self.samples_per_lens:
-                    grouped.append((lens_name, chunk))
-
-        # 镜头片段级随机打散，增强 batch 组合多样性。
-        if self.shuffle:
-            rng.shuffle(grouped)
-
-        current_batch: list[int] = []
-        current_lenses = 0
-        for _, chunk in grouped:
-            current_batch.extend(chunk)
-            current_lenses += 1
-            if current_lenses == self.lenses_per_batch:
-                yield current_batch
-                current_batch = []
-                current_lenses = 0
-
-    def __len__(self) -> int:
-        """返回理论上可形成的完整 batch 数。"""
-
-        full_groups = sum(len(indices) // self.samples_per_lens for indices in self._lens_to_indices.values())
-        return full_groups // self.lenses_per_batch
-
-
 class MixLibDataset(Dataset):
     """MixLib 图像+lens-table 配对数据集。
 
@@ -245,8 +181,6 @@ class MixLibDataset(Dataset):
         test_split_ratio: float = 0.0,
         split_seed: int = 42,
         require_psf_sfr: bool = True,
-        require_incorrect_psf_sfr: bool = False,
-        incorrect_prior_policy: str = "same_split",
         split_manifest: Optional[Dict[str, object]] = None,
         split_manifest_path: Optional[str] = None,
     ):
@@ -280,16 +214,11 @@ class MixLibDataset(Dataset):
             raise ValueError("val_split_ratio + test_split_ratio must be < 1.0")
         self.split_seed = int(split_seed)
         self.require_psf_sfr = bool(require_psf_sfr)
-        self.require_incorrect_psf_sfr = bool(require_incorrect_psf_sfr)
-        self.incorrect_prior_policy = str(incorrect_prior_policy)
-        if self.require_incorrect_psf_sfr and self.incorrect_prior_policy != "same_split":
-            raise ValueError("Only incorrect_prior_policy='same_split' is supported.")
         self.split_manifest = dict(split_manifest) if split_manifest is not None else None
         if self.split_manifest is None and split_manifest_path:
             self.split_manifest = load_lens_split_manifest(split_manifest_path)
         self.transform = transforms.ToTensor()
-        needs_psf_sfr = self.require_psf_sfr or self.require_incorrect_psf_sfr
-        self._psf_sfr_name_index = _build_name_index(self.psf_sfr_dir, "psf_sfr") if needs_psf_sfr else {}
+        self._psf_sfr_name_index = _build_name_index(self.psf_sfr_dir, "psf_sfr") if self.require_psf_sfr else {}
         # LRU 缓存：key 为解析后的绝对路径字符串。
         self._psf_sfr_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
@@ -305,7 +234,7 @@ class MixLibDataset(Dataset):
         self.samples = []
         for blur_path in self.blur_files:
             label_path = self.label_dir / f"{blur_path.stem}.txt"
-            if needs_psf_sfr and not label_path.exists():
+            if self.require_psf_sfr and not label_path.exists():
                 continue
             try:
                 gt_path = self._resolve_gt_path(blur_path)
@@ -322,27 +251,6 @@ class MixLibDataset(Dataset):
             raise FileNotFoundError("No valid MixLib samples found.")
 
         self._apply_train_val_split()
-
-        self._build_split_lens_lookup()
-
-    def _build_split_lens_lookup(self) -> None:
-        """Build same-split lens lookup used by incorrect-prior ablations."""
-
-        self._lens_to_profile: Dict[str, str] = {}
-        for sample in self.samples:
-            lens_name = str(sample.get("lens_name") or "")
-            lens_profile = str(sample.get("lens_profile") or "")
-            if lens_name and lens_profile:
-                self._lens_to_profile.setdefault(lens_name, lens_profile)
-
-        split_lenses = sorted(self._lens_to_profile)
-        self._incorrect_lens_by_lens: Dict[str, str] = {}
-        if not self.require_incorrect_psf_sfr:
-            return
-        if len(split_lenses) < 2:
-            raise ValueError("incorrectprior requires at least two lenses in the active same split.")
-        for index, lens_name in enumerate(split_lenses):
-            self._incorrect_lens_by_lens[lens_name] = split_lenses[(index + 1) % len(split_lenses)]
 
     def _apply_train_val_split(self) -> None:
         """按模式应用 train/val/test 划分策略。"""
@@ -569,22 +477,14 @@ class MixLibDataset(Dataset):
         }
 
         label_path = sample.get("label_path")
-        if self.require_psf_sfr or self.require_incorrect_psf_sfr:
+        if self.require_psf_sfr:
             # 训练/验证阶段要求每个样本都可对齐到 gt_psf_sfr。
             if label_path is None:
                 raise FileNotFoundError(f"Missing label file for sample {sample['blur_path'].name}.")
             lens_profile = str(sample.get("lens_profile") or label_path.read_text(encoding="utf-8").strip())
             lens_name = str(sample.get("lens_name") or Path(lens_profile).stem)
             output["lens_name"] = lens_name
-            if self.require_psf_sfr:
-                output["gt_psf_sfr"] = self._get_psf_sfr(lens_profile)
-            if self.require_incorrect_psf_sfr:
-                incorrect_lens = self._incorrect_lens_by_lens.get(lens_name)
-                if incorrect_lens is None:
-                    raise ValueError(f"No same-split incorrect prior available for lens '{lens_name}'.")
-                incorrect_profile = self._lens_to_profile[incorrect_lens]
-                output["incorrect_gt_psf_sfr"] = self._get_psf_sfr(incorrect_profile)
-                output["incorrect_lens_name"] = incorrect_lens
+            output["gt_psf_sfr"] = self._get_psf_sfr(lens_profile)
         else:
             output["lens_name"] = str(sample.get("lens_name") or "unknown")
 

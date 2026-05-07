@@ -6,8 +6,8 @@
 3) 可选图像导出与可视化诊断；
 4) JSON/CSV 结果落盘。
 
-数据流与训练阶段一致：
-blur -> prior_estimator -> lens_encoder -> restoration_net -> restored。
+数据流：
+blur + psf_sfr_table -> lens_encoder -> restoration_net -> restored。
 """
 
 from __future__ import annotations
@@ -140,8 +140,8 @@ def _build_output_dir(config, output_override: str | None, dataset_type: str) ->
     return str(output_dir)
 
 
-def _load_checkpoint(prior_estimator, lens_encoder, odn, restoration_net, checkpoint_path: str, device: str) -> Dict[str, Any]:
-    """加载并分发 checkpoint 权重到四个子模块。
+def _load_checkpoint(lens_encoder, restoration_net, checkpoint_path: str, device: str) -> Dict[str, Any]:
+    """加载并分发 checkpoint 权重到双模块 pipeline。
 
     同时执行 legacy key 清理，过滤掉 `total_ops/total_params` 等非参数字段。
     """
@@ -150,7 +150,6 @@ def _load_checkpoint(prior_estimator, lens_encoder, odn, restoration_net, checkp
     if not isinstance(checkpoint, dict) or "restoration_net" not in checkpoint:
         raise ValueError("Expected a Stage3 restoration checkpoint containing restoration_net.")
     checkpoint, sanitization_report = sanitize_legacy_checkpoint(checkpoint)
-    # 四模块按 key 分别加载，strict=False 便于兼容轻微结构差异。
     if "lens_table_encoder" in checkpoint:
         lens_encoder.load_state_dict(checkpoint.get("lens_table_encoder", {}), strict=False)
     restoration_state = {
@@ -183,21 +182,6 @@ def _write_results(output_dir: str, payload: Dict[str, Any], has_gt: bool) -> No
             handle.write("filename\n")
             for row in payload["per_image_results"]:
                 handle.write(f"{row['filename']}\n")
-
-
-def _resolve_prior_table(batch: Dict[str, Any], mode: str, device: str) -> torch.Tensor | None:
-    """Resolve a Stage3 prior tensor from batch fields without image-to-prior inference."""
-
-    if mode == "none":
-        return None
-    key_by_mode = {"correct_gt": "gt_psf_sfr", "incorrect_gt": "incorrect_gt_psf_sfr"}
-    key = key_by_mode.get(str(mode))
-    if key is None:
-        raise ValueError(f"Unsupported prior mode: {mode}")
-    value = batch.get(key)
-    if not torch.is_tensor(value):
-        raise KeyError(f"Batch is missing required prior tensor '{key}'.")
-    return value.to(device)
 
 
 def _print_metric_table(title: str, metrics: Dict[str, Any]) -> None:
@@ -273,7 +257,6 @@ def main() -> None:
 
     # 1) 加载配置并解析设备。
     config = load_config(args.config, args.override if args.override else None)
-    prior_mode = str(getattr(config.ablation, "eval_prior_mode", "correct_gt"))
     lens_encoder_enabled = bool(getattr(config.ablation, "lens_encoder_enabled", True))
     device = str(config.experiment.device)
     if device == "cuda" and not torch.cuda.is_available():
@@ -291,8 +274,8 @@ def main() -> None:
         (Path(output_dir) / "restored").mkdir(parents=True, exist_ok=True)
 
     # 3) 构建模型并加载 checkpoint。
-    prior_estimator, lens_encoder, odn, restoration_net = build_models_from_config(config, device)
-    checkpoint = _load_checkpoint(prior_estimator, lens_encoder, odn, restoration_net, args.checkpoint, device)
+    lens_encoder, restoration_net = build_models_from_config(config, device)
+    checkpoint = _load_checkpoint(lens_encoder, restoration_net, args.checkpoint, device)
     report = checkpoint.get("sanitization_report", {})
     if report and (report.get("removed_prior_keys") or report.get("removed_restoration_keys")):
         print(f"Checkpoint stripped legacy keys: {summarize_removed_keys(report)}")
@@ -303,8 +286,6 @@ def main() -> None:
         args.dataset_type,
         config=config,
         data_root_override=args.data_root,
-        require_psf_sfr=prior_mode in {"correct_gt", "incorrect_gt"},
-        require_incorrect_psf_sfr=prior_mode == "incorrect_gt",
     )
     if not has_gt and not args.save_restored:
         args.save_restored = True
@@ -344,13 +325,11 @@ def main() -> None:
             crop_info = crop_info.to(device) if torch.is_tensor(crop_info) else None
             gt_table = batch.get("gt_psf_sfr")
             gt_table = gt_table.to(device) if torch.is_tensor(gt_table) else None
-            # 与训练 stage3 一致的推理链路。
-            prior_table = _resolve_prior_table(batch, prior_mode, device)
-            lens_features = (
-                lens_encoder(prior_table)
-                if lens_encoder_enabled and prior_table is not None
-                else None
-            )
+            # 与训练一致的推理链路。
+            prior_table = batch.get("gt_psf_sfr")
+            if torch.is_tensor(prior_table):
+                prior_table = prior_table.to(device)
+            lens_features = lens_encoder(prior_table) if prior_table is not None else None
             restored = restoration_net(blur, lens_features, crop_info=crop_info)
 
             for index in range(int(blur.shape[0])):
@@ -419,7 +398,6 @@ def main() -> None:
         "checkpoint": args.checkpoint,
         "config": args.config,
         "ablation": dict(getattr(config.ablation, "__dict__", {})),
-        "prior_mode": prior_mode,
     }
     _write_results(output_dir, payload, has_gt=has_gt)
     _print_metric_table("Average metrics:", average_metrics)
